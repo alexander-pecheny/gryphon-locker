@@ -6,6 +6,7 @@ import ServiceManagement
 let deviceName = "iFi Hi-Res Audio"
 let heartbeat: TimeInterval = 2
 let audioGracePeriod: TimeInterval = 8
+let connectTimeout: TimeInterval = 20
 let firstRetryDelay: TimeInterval = 1
 let maxRetryDelay: TimeInterval = 30
 
@@ -36,7 +37,7 @@ final class Locker: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var locked = UserDefaults.standard.bool(forKey: "locked") {
         didSet { UserDefaults.standard.set(locked, forKey: "locked") }
     }
-    private var connecting = false
+    private var connectingSince: Date?
     private var linkedSince: Date?
     private var nextAttempt = Date.distantPast
     private var retryDelay = firstRetryDelay
@@ -60,6 +61,9 @@ final class Locker: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func enforce() {
         defer { refresh() }
         guard let device else { return }
+        if let since = connectingSince, Date().timeIntervalSince(since) > connectTimeout {
+            connectingSince = nil
+        }
         guard locked else {
             if device.isConnected() { device.closeConnection() }
             return
@@ -73,19 +77,19 @@ final class Locker: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 device.closeConnection()
                 linkedSince = nil
             }
-        } else if !connecting && Date() >= nextAttempt {
+        } else if connectingSince == nil && Date() >= nextAttempt {
             linkedSince = nil
-            connecting = true
+            connectingSince = Date()
             nextAttempt = Date().addingTimeInterval(retryDelay)
             retryDelay = min(retryDelay * 2, maxRetryDelay)
             let status = device.openConnection(self)
-            if status != kIOReturnSuccess { connecting = false }
+            if status != kIOReturnSuccess { connectingSince = nil }
         }
     }
 
     @objc(connectionComplete:status:)
     func connectionComplete(_ device: IOBluetoothDevice, status: IOReturn) {
-        connecting = false
+        connectingSince = nil
         enforce()
     }
 
