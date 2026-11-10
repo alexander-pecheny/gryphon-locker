@@ -1,6 +1,7 @@
 import AppKit
 import CoreAudio
 import IOBluetooth
+import OSLog
 import ServiceManagement
 
 let deviceName = "iFi Hi-Res Audio"
@@ -9,6 +10,10 @@ let audioGracePeriod: TimeInterval = 8
 let connectTimeout: TimeInterval = 20
 let firstRetryDelay: TimeInterval = 1
 let maxRetryDelay: TimeInterval = 30
+let slowDownAfter: TimeInterval = 5 * 60
+let slowRetryDelay: TimeInterval = 5 * 60
+
+let log = Logger(subsystem: "me.pecheny.gryphon-locker", category: "lock")
 
 /// The Gryphon links to several sources but streams to one, so only an audio device proves we own it.
 func hasAudioOutput(_ device: IOBluetoothDevice) -> Bool {
@@ -39,6 +44,8 @@ final class Locker: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private var connectingSince: Date?
     private var linkedSince: Date?
+    private var waitingSince: Date?
+    private var hadAudio = false
     private var nextAttempt = Date.distantPast
     private var retryDelay = firstRetryDelay
 
@@ -47,11 +54,12 @@ final class Locker: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        log.notice("started, locked=\(self.locked)")
         menu.delegate = self
         statusItem.menu = menu
         IOBluetoothDevice.register(forConnectNotifications: self, selector: #selector(connected(_:device:)))
         NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(retryNow), name: NSWorkspace.didWakeNotification, object: nil)
+            self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         Timer.scheduledTimer(withTimeInterval: heartbeat, repeats: true) { [weak self] _ in self?.enforce() }
         enforce()
     }
@@ -62,55 +70,81 @@ final class Locker: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { refresh() }
         guard let device else { return }
         if let since = connectingSince, Date().timeIntervalSince(since) > connectTimeout {
+            log.error("connection attempt got no reply in \(Int(connectTimeout))s")
             connectingSince = nil
         }
         guard locked else {
-            if device.isConnected() { device.closeConnection() }
+            if device.isConnected() {
+                log.notice("unlocked: dropping link")
+                device.closeConnection()
+            }
             return
         }
+        if device.isConnected() && hasAudioOutput(device) {
+            if !hadAudio { log.notice("audio connected") }
+            hadAudio = true
+            waitingSince = nil
+            retryDelay = firstRetryDelay
+            return
+        }
+        let waiting = waitingSince ?? Date()
+        waitingSince = waiting
         if device.isConnected() {
             let linked = linkedSince ?? Date()
             linkedSince = linked
-            if hasAudioOutput(device) {
-                retryDelay = firstRetryDelay
-            } else if Date().timeIntervalSince(linked) > audioGracePeriod {
+            if Date().timeIntervalSince(linked) > audioGracePeriod {
+                log.notice("linked without audio for \(Int(audioGracePeriod))s: dropping link")
                 device.closeConnection()
                 linkedSince = nil
             }
         } else if connectingSince == nil && Date() >= nextAttempt {
             linkedSince = nil
             connectingSince = Date()
+            let limit = Date().timeIntervalSince(waiting) > slowDownAfter ? slowRetryDelay : maxRetryDelay
+            retryDelay = min(retryDelay * 2, limit)
             nextAttempt = Date().addingTimeInterval(retryDelay)
-            retryDelay = min(retryDelay * 2, maxRetryDelay)
             let status = device.openConnection(self)
+            log.notice("connecting, next attempt in \(Int(self.retryDelay))s, status \(status)")
             if status != kIOReturnSuccess { connectingSince = nil }
         }
     }
 
     @objc(connectionComplete:status:)
     func connectionComplete(_ device: IOBluetoothDevice, status: IOReturn) {
+        log.notice("connection attempt finished, status \(status)")
         connectingSince = nil
         enforce()
     }
 
     @objc func connected(_ note: IOBluetoothUserNotification, device: IOBluetoothDevice) {
         guard device.addressString == self.device?.addressString else { return }
+        log.notice("link up")
         device.register(forDisconnectNotification: self, selector: #selector(disconnected(_:device:)))
         enforce()
     }
 
     @objc func disconnected(_ note: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        log.notice("link down, hadAudio=\(self.hadAudio)")
+        guard hadAudio else { return }
+        hadAudio = false
         retryNow()
     }
 
-    @objc func retryNow() {
+    @objc func woke() {
+        log.notice("woke from sleep")
+        retryNow()
+    }
+
+    private func retryNow() {
         retryDelay = firstRetryDelay
         nextAttempt = .distantPast
+        waitingSince = nil
         enforce()
     }
 
     @objc func toggleLock() {
         locked.toggle()
+        log.notice("locked=\(self.locked)")
         retryNow()
     }
 
